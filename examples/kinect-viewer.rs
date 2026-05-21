@@ -1,7 +1,7 @@
-use nect_rs::{Context, DeviceFlags, Resolution, VideoFormat, DepthFormat};
 use minifb::{Key, Window, WindowOptions};
+use nect_rs::{Context, DepthFormat, DeviceFlags, Resolution, VideoFormat};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const WIDTH: usize = 640;
@@ -9,8 +9,19 @@ const HEIGHT: usize = 480;
 const PANELS: usize = 3;
 const WIN_W: usize = WIDTH * PANELS;
 const WIN_H: usize = HEIGHT;
+const DEPTH_11BIT_MASK: usize = 0x7ff;
 
-/// Convert an 11-bit raw depth value (0..2047) to a heatmap color (u32 0x00RRGGBB).
+fn depth_color_lut() -> &'static [u32; 2048] {
+    static LUT: OnceLock<[u32; 2048]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [0u32; 2048];
+        for (raw, color) in lut.iter_mut().enumerate() {
+            *color = raw_depth_to_color(raw as u16);
+        }
+        lut
+    })
+}
+
 fn raw_depth_to_color(raw: u16) -> u32 {
     // Kinect v1 11-bit raw: closer = larger value, far = smaller value
     let t = (raw as f32 / 2047.0).clamp(0.0, 1.0);
@@ -28,6 +39,27 @@ fn raw_depth_to_color(raw: u16) -> u32 {
         (255, ((1.0 - u) * 255.0) as u8, 0)
     };
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn packed_depth_to_colors(data: &[u8], colors: &mut [u32]) {
+    let lut = depth_color_lut();
+    let pixels = colors.len().min((data.len() / 11) * 8);
+    let mut unpacked = [0u16; 8];
+
+    for (raw, out) in data
+        .chunks_exact(11)
+        .zip(colors[..pixels].chunks_exact_mut(8))
+    {
+        nect_rs::cameras::unpack_8_pixels(raw, &mut unpacked);
+        out[0] = lut[(unpacked[0] as usize) & DEPTH_11BIT_MASK];
+        out[1] = lut[(unpacked[1] as usize) & DEPTH_11BIT_MASK];
+        out[2] = lut[(unpacked[2] as usize) & DEPTH_11BIT_MASK];
+        out[3] = lut[(unpacked[3] as usize) & DEPTH_11BIT_MASK];
+        out[4] = lut[(unpacked[4] as usize) & DEPTH_11BIT_MASK];
+        out[5] = lut[(unpacked[5] as usize) & DEPTH_11BIT_MASK];
+        out[6] = lut[(unpacked[6] as usize) & DEPTH_11BIT_MASK];
+        out[7] = lut[(unpacked[7] as usize) & DEPTH_11BIT_MASK];
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,17 +108,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        let depth_mode = nect_rs::Device::find_depth_mode(Resolution::Medium, DepthFormat::Bit11Packed);
+        let depth_mode =
+            nect_rs::Device::find_depth_mode(Resolution::Medium, DepthFormat::Bit11Packed);
         dev.set_depth_mode(depth_mode)?;
 
         let px = Arc::clone(&depth_pixels);
         dev.set_depth_callback(move |data: &[u8], _ts: u32| {
             let mut buf = px.lock().unwrap();
-            let mut unpacked = vec![0u16; WIDTH * HEIGHT];
-            nect_rs::cameras::convert_packed11_to_16bit(data, &mut unpacked, WIDTH * HEIGHT);
-            for i in 0..(WIDTH * HEIGHT) {
-                buf[i] = raw_depth_to_color(unpacked[i]);
-            }
+            packed_depth_to_colors(data, &mut buf);
         });
 
         dev.set_video_mode(rgb_mode)?;
@@ -148,8 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let adjust_left = window.is_key_down(Key::Left);
                 let adjust_right = window.is_key_down(Key::Right);
                 if adjust_left || adjust_right {
-                    let shift_down = window.is_key_down(Key::LeftShift)
-                        || window.is_key_down(Key::RightShift);
+                    let shift_down =
+                        window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
 
                     if show_ir || shift_down {
                         let delta = if adjust_right { 1i32 } else { -1i32 };
